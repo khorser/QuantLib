@@ -141,6 +141,13 @@ namespace QuantLib {
         const std::vector<Real>& data() const;
         std::vector<std::pair<Date, Real> > nodes() const;
         //@}
+        //! \name Bootstrap helpers
+        //@{
+        //! the bootstrap may reorder them, e.g. by pillar date
+        const std::vector<ext::shared_ptr<typename Traits::helper>>& instruments() const {
+            return instruments_;
+        }
+        //@}
         //! \name Observer interface
         //@{
         void update() override;

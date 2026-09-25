@@ -2470,6 +2470,28 @@ BOOST_AUTO_TEST_CASE(testHelperDatesFromNonBusinessEvaluationDate) {
                     "    obtained: " << bmaHelper->earliestDate());
 }
 
+BOOST_AUTO_TEST_CASE(testInstruments) {
+
+    BOOST_TEST_MESSAGE("Testing the helpers returned by a piecewise yield curve...");
+
+    Date today(15, January, 2024);
+    Settings::instance().evaluationDate() = today;
+
+    auto euribor6m = ext::make_shared<Euribor6M>();
+    std::vector<ext::shared_ptr<RateHelper>> helpers = {
+        ext::make_shared<SwapRateHelper>(0.03, 5 * Years, TARGET(), Annual, Unadjusted,
+                                         Thirty360(Thirty360::BondBasis), euribor6m),
+        ext::make_shared<DepositRateHelper>(0.03, euribor6m)
+    };
+    PiecewiseYieldCurve<Discount, LogLinear> curve(today, helpers, Actual365Fixed());
+
+    BOOST_CHECK(curve.instruments() == helpers);
+
+    curve.discount(1.0);
+    BOOST_CHECK(std::is_permutation(curve.instruments().begin(), curve.instruments().end(),
+                                    helpers.begin(), helpers.end()));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE_END()
