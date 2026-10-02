@@ -65,15 +65,34 @@ namespace QuantLib {
               the finite difference Heston-Hull-White engine
     */
 
+    /*! The approximation replaces \f$ \sqrt{v_s} \f$ in the equity/rate
+        cross term by its expectation. By default (FittedExponential) that
+        expectation is itself approximated by \f$ a + b e^{-cs} \f$, as in
+        the reference, with \f$ c \f$ fitted at \f$ s = 1 \f$ or
+        \f$ s = 1/\kappa \f$, depending on the variance parameters. The fit
+        can fail where the expectation is not monotone (for instance
+        \f$ v_0 \f$ close to \f$ \theta \f$), and the engine then fails.
+        Exact integrates the expectation by Gauss-Legendre quadrature on
+        meanIntegrationOrder nodes, using an asymptotic approximation at
+        large noncentrality.
+    */
     class AnalyticH1HWEngine : public AnalyticHestonHullWhiteEngine {
       public:
-        AnalyticH1HWEngine(const ext::shared_ptr<HestonModel>& model,
-                           const ext::shared_ptr<HullWhite>& hullWhiteModel,
-                           Real rhoSr, Size integrationOrder = 144);
+        enum class VarianceRootMean { FittedExponential, Exact };
 
         AnalyticH1HWEngine(const ext::shared_ptr<HestonModel>& model,
                            const ext::shared_ptr<HullWhite>& hullWhiteModel,
-                           Real rhoSr, Real relTolerance, Size maxEvaluations);
+                           Real rhoSr, Size integrationOrder = 144,
+                           VarianceRootMean mean = VarianceRootMean::FittedExponential,
+                           Size meanIntegrationOrder = 64);
+
+        AnalyticH1HWEngine(const ext::shared_ptr<HestonModel>& model,
+                           const ext::shared_ptr<HullWhite>& hullWhiteModel,
+                           Real rhoSr, Real relTolerance, Size maxEvaluations,
+                           VarianceRootMean mean = VarianceRootMean::FittedExponential,
+                           Size meanIntegrationOrder = 64);
+
+        void update() override;
 
       protected:
         std::complex<Real> addOnTerm(Real phi, Time t, Size j) const override;
@@ -81,7 +100,18 @@ namespace QuantLib {
       private:
         class Fj_Helper;
 
+        Real exactMeanIntegral(Time t) const;
+
         const Real rhoSr_;
+        const VarianceRootMean mean_;
+        const Size meanIntegrationOrder_;
+
+        // the exact-mean integral does not depend on the Fourier node,
+        // so it is kept for the last maturity and model parameters
+        mutable bool cached_ = false;
+        mutable Time cachedT_ = 0.0;
+        mutable Real cachedV0_ = 0.0, cachedKappa_ = 0.0, cachedTheta_ = 0.0,
+                     cachedSigma_ = 0.0, cachedA_ = 0.0, cachedIntegral_ = 0.0;
     };
 }
 

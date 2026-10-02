@@ -1413,6 +1413,242 @@ BOOST_AUTO_TEST_CASE(testH1HWPricingEngine) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(testH1HWExactVarianceRootMean) {
+    BOOST_TEST_MESSAGE("Testing the H1-HW engine with the exact E[sqrt(v)]...");
+
+    const Date today = Date(2, January, 2026);
+    Settings::instance().evaluationDate() = today;
+    const DayCounter dc = Actual365Fixed();
+
+    const Handle<Quote> s0(ext::make_shared<SimpleQuote>(100.0));
+    const Handle<YieldTermStructure> rTS(flatRate(today, 0.02, dc));
+    const Handle<YieldTermStructure> qTS(flatRate(today, 0.0, dc));
+
+    const Real kappa_r = 0.05;
+    const Real sigma_r = 0.03;
+    const Real rho_sr = 0.6;
+    const auto hullWhiteModel =
+        ext::make_shared<HullWhite>(rTS, kappa_r, sigma_r);
+    const auto hwProcess =
+        ext::make_shared<HullWhiteProcess>(rTS, kappa_r, sigma_r);
+
+    using Mean = AnalyticH1HWEngine::VarianceRootMean;
+
+    struct HestonParameters { Real v0, kappa, theta, sigma, rho; };
+    // E[sqrt(v_t)] falls from sqrt(v0) and then rises towards its limit,
+    // so the fitted form has no solution
+    const HestonParameters nonMonotone = { 0.04, 1.5, 0.05, 0.4, -0.6 };
+    const HestonParameters sweep[] = {
+        nonMonotone,
+        { 0.06, 1.0, 0.03, 0.6, -0.3 },
+        { 0.04, 1.0, 0.05, 0.4, -0.6 },
+        { 0.05, 0.3, 0.05, 0.5, -0.3 },  // 8 kappa theta / sigma^2 < 1
+        { 0.04, 3.0, 0.04, 0.2, -0.5 },  // 8 kappa theta / sigma^2 > 1
+        { 1.0e-4, 1.5, 0.05, 0.4, -0.6 }  // v0 far below theta
+    };
+    const Integer days[] = { 182, 365, 730 };
+    const Real strikes[] = { 90.0, 100.0, 110.0 };
+
+    const auto option = [&](Integer d, Real strike) {
+        return ext::make_shared<VanillaOption>(
+            ext::make_shared<PlainVanillaPayoff>(
+                strike < 100.0 ? Option::Put : Option::Call, strike),
+            ext::make_shared<EuropeanExercise>(today + d));
+    };
+
+    for (const auto& p : sweep) {
+        const auto hestonModel = ext::make_shared<HestonModel>(
+            ext::make_shared<HestonProcess>(
+                rTS, qTS, s0, p.v0, p.kappa, p.theta, p.sigma, p.rho));
+        const auto exact = ext::make_shared<AnalyticH1HWEngine>(
+            hestonModel, hullWhiteModel, rho_sr, 144, Mean::Exact);
+        const auto exactUncorrelated = ext::make_shared<AnalyticH1HWEngine>(
+            hestonModel, hullWhiteModel, 0.0, 144, Mean::Exact);
+        const auto hestonHullWhite =
+            ext::make_shared<AnalyticHestonHullWhiteEngine>(
+                hestonModel, hullWhiteModel, 144);
+
+        for (Integer d : days) {
+            for (Real strike : strikes) {
+                const auto o = option(d, strike);
+                o->setPricingEngine(exact);
+                const Real exactNpv = o->NPV();
+                if (!std::isfinite(exactNpv))
+                    BOOST_ERROR("H1-HW with the exact mean is not finite"
+                                << "\n   v0, kappa      : " << p.v0 << ", " << p.kappa
+                                << "\n   theta, sigma   : " << p.theta << ", " << p.sigma
+                                << "\n   days, strike   : " << d << ", " << strike);
+
+                // without the cross term the mean does not enter
+                o->setPricingEngine(exactUncorrelated);
+                const Real uncorrelated = o->NPV();
+                o->setPricingEngine(hestonHullWhite);
+                const Real analytic = o->NPV();
+                if (std::fabs(uncorrelated - analytic) > 1.0e-12)
+                    BOOST_ERROR("uncorrelated H1-HW is not the analytic "
+                                "Heston-Hull-White price"
+                                << "\n   exact mean     : " << uncorrelated
+                                << "\n   analytic       : " << analytic);
+            }
+        }
+    }
+
+    const auto hestonModel = ext::make_shared<HestonModel>(
+        ext::make_shared<HestonProcess>(
+            rTS, qTS, s0, nonMonotone.v0, nonMonotone.kappa, nonMonotone.theta,
+            nonMonotone.sigma, nonMonotone.rho));
+    const auto fitted = ext::make_shared<AnalyticH1HWEngine>(
+        hestonModel, hullWhiteModel, rho_sr, 144);
+    const auto exact = ext::make_shared<AnalyticH1HWEngine>(
+        hestonModel, hullWhiteModel, rho_sr, 144, Mean::Exact);
+    const auto fd = ext::make_shared<FdHestonHullWhiteVanillaEngine>(
+        hestonModel, hwProcess, rho_sr);
+
+    // the H1-HW approximation itself, measured against finite differences
+    const Real tol = 0.015;
+    const std::pair<Integer, Real> compared[] = {
+        { 182, 90.0 }, { 365, 100.0 }, { 730, 110.0 } };
+    for (const auto& c : compared) {
+        const auto o = option(c.first, c.second);
+        o->setPricingEngine(fitted);
+        BOOST_CHECK_THROW(o->NPV(), Error);
+
+        o->setPricingEngine(exact);
+        const Real exactNpv = o->NPV();
+        o->setPricingEngine(fd);
+        const Real fdNpv = o->NPV();
+        if (std::fabs(exactNpv - fdNpv) > tol*fdNpv)
+            BOOST_ERROR("H1-HW with the exact mean is not the "
+                        "finite-difference price"
+                        << "\n   exact mean     : " << exactNpv
+                        << "\n   finite diff.   : " << fdNpv
+                        << "\n   tol            : " << tol
+                        << "\n   days, strike   : " << c.first << ", " << c.second);
+    }
+
+    // where the fitted form holds, the exact mean moves the implied
+    // volatilities of testH1HWPricingEngine by less than half a point;
+    // against finite differences neither form is consistently closer
+    const Date reference = Date(15, July, 2012);
+    Settings::instance().evaluationDate() = reference;
+    const Handle<YieldTermStructure> rTS2(flatRate(reference, 0.02, dc));
+    const Handle<YieldTermStructure> qTS2(flatRate(reference, 0.0, dc));
+    const auto bsProcess = ext::make_shared<GeneralizedBlackScholesProcess>(
+        s0, qTS2, rTS2, Handle<BlackVolTermStructure>(flatVol(reference, 0.20, dc)));
+    const auto hullWhite2 = ext::make_shared<HullWhite>(rTS2, 0.01, 0.01);
+    const auto exercise =
+        ext::make_shared<EuropeanExercise>(Date(13, July, 2022));
+    for (Real sigma_v : { 0.3, 0.6 }) {
+        const auto hestonModel = ext::make_shared<HestonModel>(
+            ext::make_shared<HestonProcess>(
+                rTS2, qTS2, s0, 0.05, 0.3, 0.05, sigma_v, -0.3));
+        const auto fitted = ext::make_shared<AnalyticH1HWEngine>(
+            hestonModel, hullWhite2, 0.6, 144);
+        const auto exact = ext::make_shared<AnalyticH1HWEngine>(
+            hestonModel, hullWhite2, 0.6, 144, Mean::Exact);
+        for (Real strike : { 40.0, 80.0, 100.0, 120.0, 180.0 }) {
+            VanillaOption option(
+                ext::make_shared<PlainVanillaPayoff>(Option::Call, strike),
+                exercise);
+            option.setPricingEngine(fitted);
+            const Real fittedVol =
+                option.impliedVolatility(option.NPV(), bsProcess);
+            option.setPricingEngine(exact);
+            const Real exactVol =
+                option.impliedVolatility(option.NPV(), bsProcess);
+            if (std::fabs(exactVol - fittedVol) > 5.0e-3)
+                BOOST_ERROR("the exact mean moves the H1-HW implied volatility"
+                            << "\n   fitted mean    : " << fittedVol
+                            << "\n   exact mean     : " << exactVol
+                            << "\n   strike         : " << strike
+                            << "\n   sigma          : " << sigma_v);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testH1HWExactVarianceRootMeanLimits) {
+    BOOST_TEST_MESSAGE("Testing exact-mean H1-HW numerical limits...");
+
+    const Date today(2, January, 2026);
+    Settings::instance().evaluationDate() = today;
+    const DayCounter dc = Actual365Fixed();
+    const Handle<Quote> s0(ext::make_shared<SimpleQuote>(100.0));
+    const Handle<YieldTermStructure> rTS(flatRate(today, 0.02, dc));
+    const Handle<YieldTermStructure> qTS(flatRate(today, 0.0, dc));
+    const auto bsProcess = ext::make_shared<GeneralizedBlackScholesProcess>(
+        s0, qTS, rTS, Handle<BlackVolTermStructure>(flatVol(today, 0.20, dc)));
+    VanillaOption option(ext::make_shared<PlainVanillaPayoff>(Option::Call, 100.0),
+                         ext::make_shared<EuropeanExercise>(today + 730));
+    using Mean = AnalyticH1HWEngine::VarianceRootMean;
+
+    const auto check = [&](Real kappa, Real sigma, Real a) {
+        const auto hullWhite = ext::make_shared<HullWhite>(rTS, a, 0.03);
+        const auto heston = ext::make_shared<HestonModel>(ext::make_shared<HestonProcess>(
+            rTS, qTS, s0, 0.04, kappa, 0.04, sigma, -0.6));
+        option.setPricingEngine(ext::make_shared<AnalyticBSMHullWhiteEngine>(
+            0.6, bsProcess, hullWhite));
+        const Real expected = option.NPV();
+        for (bool adaptive : {false, true}) {
+            const ext::shared_ptr<PricingEngine> engine = adaptive
+                ? ext::make_shared<AnalyticH1HWEngine>(
+                      heston, hullWhite, 0.6, 1.0e-6, 10000, Mean::Exact)
+                : ext::make_shared<AnalyticH1HWEngine>(
+                      heston, hullWhite, 0.6, 144, Mean::Exact);
+            option.setPricingEngine(engine);
+            const Real calculated = option.NPV();
+            BOOST_CHECK(std::isfinite(calculated));
+            if (std::fabs(calculated - expected) > 1.0e-6*expected)
+                BOOST_ERROR("Exact-mean H1-HW does not approach BSM-HW"
+                            << "\n   kappa, sigma, a : " << kappa << ", " << sigma << ", " << a
+                            << "\n   adaptive        : " << adaptive
+                            << "\n   expected        : " << expected
+                            << "\n   calculated      : " << calculated);
+        }
+    };
+    for (Real sigma : {1.0e-5, 1.0e-6, 1.0e-7, 1.0e-8})
+        check(100.0, sigma, 0.05);
+    for (Real a : {1.0e-8, 1.0e-12, 1.0e-18})
+        check(1.5, 1.0e-5, a);
+}
+
+BOOST_AUTO_TEST_CASE(testH1HWExactVarianceRootMeanCache) {
+    BOOST_TEST_MESSAGE("Testing exact-mean H1-HW cache invalidation...");
+
+    const Date today(2, January, 2026);
+    Settings::instance().evaluationDate() = today;
+    const DayCounter dc = Actual365Fixed();
+    const Handle<Quote> s0(ext::make_shared<SimpleQuote>(100.0));
+    const Handle<YieldTermStructure> rTS(flatRate(today, 0.02, dc));
+    const Handle<YieldTermStructure> qTS(flatRate(today, 0.0, dc));
+    const auto heston = ext::make_shared<HestonModel>(ext::make_shared<HestonProcess>(
+        rTS, qTS, s0, 0.04, 1.5, 0.05, 0.4, -0.6));
+    const auto hullWhite = ext::make_shared<HullWhite>(rTS, 0.05, 0.03);
+    using Mean = AnalyticH1HWEngine::VarianceRootMean;
+    const auto reused = ext::make_shared<AnalyticH1HWEngine>(
+        heston, hullWhite, 0.6, 144, Mean::Exact);
+    VanillaOption option(ext::make_shared<PlainVanillaPayoff>(Option::Call, 100.0),
+                         ext::make_shared<EuropeanExercise>(today + 730));
+    option.setPricingEngine(reused);
+    Real previous = option.NPV();
+
+    const auto check = [&]() {
+        const Real calculated = option.NPV();
+        BOOST_CHECK(std::isfinite(calculated));
+        BOOST_CHECK(std::fabs(calculated - previous) > 1.0e-6);
+        option.setPricingEngine(ext::make_shared<AnalyticH1HWEngine>(
+            heston, hullWhite, 0.6, 144, Mean::Exact));
+        const Real expected = option.NPV();
+        BOOST_CHECK(std::isfinite(expected));
+        BOOST_CHECK_SMALL(calculated - expected, 1.0e-12);
+        previous = calculated;
+        option.setPricingEngine(reused);
+    };
+    heston->setParams(Array{0.06, 1.2, 0.3, -0.5, 0.035});
+    check();
+    hullWhite->setParams(Array{0.08, 0.025});
+    check();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE_END()
